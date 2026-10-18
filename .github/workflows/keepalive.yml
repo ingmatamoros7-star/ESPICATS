@@ -1,0 +1,15 @@
+name: keep-alive ESPICATS
+# Mantiene despierta la app de Render (plan free) visitándola cada ~10 min.
+# Repo público => minutos de Actions gratis e ilimitados.
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch: {}
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping ESPICATS
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 90 https://espicats.onrender.com/login.html)
+          echo "Ping -> HTTP $code"
