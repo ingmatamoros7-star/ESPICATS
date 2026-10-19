@@ -1,0 +1,98 @@
+name: backup ESPICATS DB
+# Respalda la base de datos de ESPICATS (Render free tier, sin disco persistente).
+# Flujo: login como admin → exportar DB como JSON → commit al branch "backups".
+# Al reiniciar la app tras un redeploy, esta restaura desde el último backup.
+on:
+  schedule:
+    - cron: '0 */2 * * *'   # cada 2 horas
+  workflow_dispatch: {}       # disparo manual desde GitHub
+
+env:
+  APP_URL: https://espicats.onrender.com
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: backups
+          fetch-depth: 1
+
+      - name: Login y obtener token JWT
+        id: auth
+        run: |
+          RESP=$(curl -s -X POST "$APP_URL/api/auth/login" \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"admin\",\"password\":\"${{ secrets.ADMIN_PASSWORD }}\"}")
+          TOKEN=$(echo "$RESP" | jq -r '.token // empty')
+          if [ -z "$TOKEN" ]; then
+            echo "::warning::No se pudo obtener token de login. La app puede estar dormida."
+            # Intentar despertar y reintentar
+            curl -s "$APP_URL/login.html" > /dev/null
+            sleep 30
+            RESP=$(curl -s -X POST "$APP_URL/api/auth/login" \
+              -H "Content-Type: application/json" \
+              -d "{\"username\":\"admin\",\"password\":\"${{ secrets.ADMIN_PASSWORD }}\"}")
+            TOKEN=$(echo "$RESP" | jq -r '.token // empty')
+          fi
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Login fallido tras reintentos."
+            exit 1
+          fi
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Forzar backup y descargar
+        run: |
+          # Disparar backup externo desde la API
+          RESP=$(curl -s -X POST "$APP_URL/api/backup/push" \
+            -H "Authorization: Bearer ${{ steps.auth.outputs.token }}" \
+            -H "Content-Type: application/json" \
+            --max-time 60)
+          echo "Push response: $RESP"
+
+          # También guardar una copia vía export directo
+          # (por si el push a GitHub desde la app falla por falta de token)
+          curl -s "$APP_URL/api/backup/status" \
+            -H "Authorization: Bearer ${{ steps.auth.outputs.token }}" | jq .
+
+      - name: Exportar DB como JSON local
+        run: |
+          # Descargar las tablas principales como JSON usando la API existente
+          TOKEN="${{ steps.auth.outputs.token }}"
+          AUTH="Authorization: Bearer $TOKEN"
+
+          mkdir -p data
+
+          # Exportar endpoints que devuelven listados
+          for EP in clientes vehiculos conductores guias operaciones pagos; do
+            curl -s "$APP_URL/api/$EP" -H "$AUTH" > "data/${EP}.json" 2>/dev/null || echo "[]" > "data/${EP}.json"
+          done
+
+          # Exportar envíos, manifiestos, caja, sucursales, tarifas
+          for EP in envios manifiestos caja/movimientos sucursales tarifas; do
+            FNAME=$(echo "$EP" | tr '/' '-')
+            curl -s "$APP_URL/api/$EP" -H "$AUTH" > "data/${FNAME}.json" 2>/dev/null || echo "[]" > "data/${FNAME}.json"
+          done
+
+          # Exportar configuración
+          curl -s "$APP_URL/api/config" > "data/config.json" 2>/dev/null || echo "{}" > "data/config.json"
+
+          # Metadata
+          echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"source\":\"github-action\"}" > data/meta.json
+
+          ls -la data/
+
+      - name: Commit backup
+        run: |
+          git config user.name "ESPICATS Backup Bot"
+          git config user.email "backup@espicats.local"
+          git add data/
+          if git diff --cached --quiet; then
+            echo "Sin cambios en los datos."
+          else
+            ROWS=$(cat data/*.json | jq -s 'map(if type == "array" then length else 0 end) | add' 2>/dev/null || echo "?")
+            git commit -m "backup: $(date -u +%Y-%m-%d\ %H:%M) UTC — ${ROWS} registros"
+            git push origin backups
+            echo "✅ Backup committeado al branch backups."
+          fi
